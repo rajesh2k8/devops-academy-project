@@ -1,0 +1,11 @@
+pipeline {
+  agent any
+  options { timestamps() }
+  stages {
+    stage('Disabled') {
+      steps {
+        error 'Destroy pipeline has been disabled and cannot be used.'
+      }
+    }
+  }
+}

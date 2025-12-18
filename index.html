@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Click the Shape Game</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background: #f7f9fc;
+      margin: 0;
+      padding: 0;
+    }
+
+    h1 {
+      margin-top: 20px;
+      color: #333;
+    }
+
+    #game-info {
+      margin: 10px 0;
+      font-size: 18px;
+    }
+
+    #game-area {
+      margin: 20px auto;
+      border: 2px solid #333;
+      width: 500px;
+      height: 300px;
+      position: relative;
+      background: #ffffff;
+      overflow: hidden;
+    }
+
+    .shape {
+      width: 50px;
+      height: 50px;
+      background: #ff6666;
+      border-radius: 50%;
+      position: absolute;
+      cursor: pointer;
+      box-shadow: 0 0 5px rgba(0,0,0,0.3);
+    }
+
+    #controls {
+      margin-bottom: 20px;
+    }
+
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      font-size: 16px;
+      cursor: pointer;
+      border: none;
+      border-radius: 5px;
+      background: #4caf50;
+      color: white;
+    }
+
+    button:hover {
+      background: #45a049;
+    }
+
+    #message {
+      font-size: 18px;
+      margin-top: 10px;
+      color: #333;
+      min-height: 24px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Click the Shape!</h1>
+  <div id="game-info">
+    <span>Score: <strong id="score">0</strong></span> |
+    <span>Time Left: <strong id="time">30</strong> seconds</span>
+  </div>
+
+  <div id="controls">
+    <button id="start-btn">Start Game</button>
+    <button id="reset-btn">Reset</button>
+  </div>
+
+  <div id="game-area"></div>
+
+  <div id="message"></div>
+
+  <script>
+    const gameArea = document.getElementById('game-area');
+    const scoreEl = document.getElementById('score');
+    const timeEl = document.getElementById('time');
+    const messageEl = document.getElementById('message');
+    const startBtn = document.getElementById('start-btn');
+    const resetBtn = document.getElementById('reset-btn');
+
+    let score = 0;
+    let timeLeft = 30;
+    let timer = null;
+    let shapeTimeout = null;
+    let gameRunning = false;
+
+    function randomPosition(max) {
+      return Math.floor(Math.random() * max);
+    }
+
+    function randomColor() {
+      const colors = ['#ff6666', '#66b3ff', '#ffd966', '#93c47d', '#c27ba0'];
+      return colors[Math.floor(Math.random() * colors.length)];
+    }
+
+    function createShape() {
+      // Clear old shape
+      gameArea.innerHTML = '';
+
+      const shape = document.createElement('div');
+      shape.classList.add('shape');
+
+      // Randomize shape position inside game area
+      const areaWidth = gameArea.clientWidth;
+      const areaHeight = gameArea.clientHeight;
+      const size = 50;
+
+      const x = randomPosition(areaWidth - size);
+      const y = randomPosition(areaHeight - size);
+
+      shape.style.left = x + 'px';
+      shape.style.top = y + 'px';
+
+      // Random color
+      shape.style.backgroundColor = randomColor();
+
+      // Sometimes circle, sometimes square
+      shape.style.borderRadius = Math.random() > 0.5 ? '50%' : '10%';
+
+      shape.addEventListener('click', () => {
+        if (!gameRunning) return;
+        score++;
+        scoreEl.textContent = score;
+        createShape();
+      });
+
+      gameArea.appendChild(shape);
+
+      // Move shape every 1.2s if not clicked
+      if (shapeTimeout) clearTimeout(shapeTimeout);
+      shapeTimeout = setTimeout(() => {
+        if (gameRunning) createShape();
+      }, 1200);
+    }
+
+    function startGame() {
+      if (gameRunning) return;
+      gameRunning = true;
+      score = 0;
+      timeLeft = 30;
+      scoreEl.textContent = score;
+      timeEl.textContent = timeLeft;
+      messageEl.textContent = 'Click the shape as fast as you can!';
+
+      createShape();
+
+      timer = setInterval(() => {
+        timeLeft--;
+        timeEl.textContent = timeLeft;
+
+        if (timeLeft <= 0) {
+          endGame();
+        }
+      }, 1000);
+    }
+
+    function endGame() {
+      gameRunning = false;
+      clearInterval(timer);
+      clearTimeout(shapeTimeout);
+      gameArea.innerHTML = '';
+      messageEl.textContent = 'Time is up! Your score: ' + score;
+    }
+
+    function resetGame() {
+      gameRunning = false;
+      clearInterval(timer);
+      clearTimeout(shapeTimeout);
+      score = 0;
+      timeLeft = 30;
+      scoreEl.textContent = score;
+      timeEl.textContent = timeLeft;
+      gameArea.innerHTML = '';
+      messageEl.textContent = 'Game reset. Click "Start Game" to play again.';
+    }
+
+    startBtn.addEventListener('click', startGame);
+    resetBtn.addEventListener('click', resetGame);
+  </script>
+</body>
+</html>
