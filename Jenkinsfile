@@ -176,6 +176,10 @@ pipeline {
         ]) {
           sh '''
             set -euo pipefail
+            # Use a workspace-scoped Docker config to avoid system credential helpers like 'docker-credential-desktop'
+            export DOCKER_CONFIG="${WORKSPACE}/.docker"
+            mkdir -p "${DOCKER_CONFIG}"
+            printf '{}' > "${DOCKER_CONFIG}/config.json"
             ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
             ECR_REG="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
             REPO="${ECR_REPO}"
