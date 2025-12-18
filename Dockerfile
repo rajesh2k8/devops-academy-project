@@ -3,6 +3,7 @@ FROM nginx:stable
 
 # Optional: serve a custom landing page
 COPY ./index.html /usr/share/nginx/html/index.html
+COPY ./nginx.conf /etc/nginx/conf.d/default.conf
 
-# Expose default port (informational)
-EXPOSE 80
+# Expose app port (informational)
+EXPOSE 8080
