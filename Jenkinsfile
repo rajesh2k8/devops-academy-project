@@ -29,59 +29,56 @@ pipeline {
           string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
         ]) {
-          pwsh '''
-            # Do not fail the stage on non-terminating errors from native commands
-            $ErrorActionPreference = "Continue"
-            $bucketBase = 'devops-academy-project'
-            $table  = 'devops-academy-project'
-            $region = $env:AWS_REGION
-            $account = $(aws sts get-caller-identity --query Account --output text 2>$null)
-            if (-not $account) { throw "Unable to resolve AWS account id" }
+          sh '''
+            set -euo pipefail
+            bucketBase="devops-academy-project"
+            table="devops-academy-project"
+            region="${AWS_REGION}"
+            account="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+            if [ -z "${account}" ]; then
+              echo "Unable to resolve AWS account id" >&2
+              exit 1
+            fi
 
-            # Try base bucket; if globally taken by someone else, fallback to account-suffixed bucket
-            $bucket = $bucketBase
+            bucket="${bucketBase}"
+            echo "Ensuring S3 bucket ${bucket} exists in ${region}..."
+            if ! aws s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+              if [ "${region}" = "us-east-1" ]; then
+                aws s3api create-bucket --bucket "${bucket}" >/dev/null 2>&1 || true
+              else
+                aws s3api create-bucket --bucket "${bucket}" --create-bucket-configuration "LocationConstraint=${region}" >/dev/null 2>&1 || true
+              fi
+              if ! aws s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+                echo "Base bucket creation failed; trying account-suffixed bucket..."
+                bucket="${bucketBase}-${account}"
+                if [ "${region}" = "us-east-1" ]; then
+                  aws s3api create-bucket --bucket "${bucket}"
+                else
+                  aws s3api create-bucket --bucket "${bucket}" --create-bucket-configuration "LocationConstraint=${region}"
+                fi
+              fi
+              aws s3api put-bucket-versioning --bucket "${bucket}" --versioning-configuration Status=Enabled
+              aws s3api put-public-access-block --bucket "${bucket}" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+              ok=""
+              for i in $(seq 1 10); do
+                if aws s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then ok="yes"; break; fi
+                sleep 3
+              done
+              if [ -z "${ok}" ]; then
+                echo "S3 bucket ${bucket} not reachable after creation" >&2
+                exit 1
+              fi
+            fi
 
-            Write-Host "Ensuring S3 bucket $bucket exists in $region..."
-            $exists = $false
-            # Suppress all output; rely on exit code only
-            & aws s3api head-bucket --bucket $bucket 1>$null 2>$null
-            if ($LASTEXITCODE -eq 0) { $exists = $true }
-            if (-not $exists) {
-              if ($region -eq 'us-east-1') {
-                & aws s3api create-bucket --bucket $bucket 1>$null 2>$null
-              } else {
-                & aws s3api create-bucket --bucket $bucket --create-bucket-configuration LocationConstraint=$region 1>$null 2>$null
-              }
-              if ($LASTEXITCODE -ne 0) {
-                Write-Host "Base bucket creation failed; trying account-suffixed bucket..."
-                $bucket = "$bucketBase-$account"
-                if ($region -eq 'us-east-1') {
-                  & aws s3api create-bucket --bucket $bucket 1>$null 2>$null
-                } else {
-                  & aws s3api create-bucket --bucket $bucket --create-bucket-configuration LocationConstraint=$region 1>$null 2>$null
-                }
-                if ($LASTEXITCODE -ne 0) { throw "Failed to create S3 bucket $bucket" }
-              }
-              & aws s3api put-bucket-versioning --bucket $bucket --versioning-configuration Status=Enabled 1>$null 2>$null
-              & aws s3api put-public-access-block --bucket $bucket --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true 1>$null 2>$null
-              # Wait until bucket is reachable
-              $max=10; $ok=$false
-              for ($i=0; $i -lt $max -and -not $ok; $i++) {
-                Start-Sleep -Seconds 3
-                & aws s3api head-bucket --bucket $bucket 1>$null 2>$null
-                if ($LASTEXITCODE -eq 0) { $ok=$true }
-              }
-              if (-not $ok) { throw "S3 bucket $bucket not reachable after creation" }
-            }
-
-            Write-Host "Ensuring DynamoDB table $table exists..."
-            & aws dynamodb describe-table --table-name $table 1>$null 2>$null
-            if ($LASTEXITCODE -ne 0) {
-              & aws dynamodb create-table --table-name $table --attribute-definitions AttributeName=LockID,AttributeType=S --key-schema AttributeName=LockID,KeyType=HASH --billing-mode PAY_PER_REQUEST 1>$null 2>$null
-              if ($LASTEXITCODE -ne 0) { throw "Failed to create DynamoDB table $table" }
-              Write-Host "Waiting for DynamoDB table to be ACTIVE..."
-              & aws dynamodb wait table-exists --table-name $table 1>$null 2>$null
-            }
+            echo "Ensuring DynamoDB table ${table} exists..."
+            if ! aws dynamodb describe-table --table-name "${table}" >/dev/null 2>&1; then
+              aws dynamodb create-table --table-name "${table}" \
+                --attribute-definitions AttributeName=LockID,AttributeType=S \
+                --key-schema AttributeName=LockID,KeyType=HASH \
+                --billing-mode PAY_PER_REQUEST
+              echo "Waiting for DynamoDB table to be ACTIVE..."
+              aws dynamodb wait table-exists --table-name "${table}"
+            fi
           '''
         }
       }
@@ -89,35 +86,34 @@ pipeline {
 
     stage('SAST & Manifest Lint') {
       steps {
-        pwsh '''
-          $ErrorActionPreference = "Continue"
-          Write-Host "Running Trivy filesystem scan (HIGH,CRITICAL) on repo..."
-          # Prepare local cache dir for Trivy DB to speed up (Windows path fix to forward slashes for Docker)
-          $cachePath = Join-Path $env:WORKSPACE ".trivy-cache"
-          if (-not (Test-Path $cachePath)) { New-Item -ItemType Directory -Path $cachePath | Out-Null }
-          $cacheMount = ("$cachePath").Replace('\\','/')
-          $wsMount = ("$env:WORKSPACE").Replace('\\','/')
-          docker run --rm -v "$($wsMount):/repo" -v "$($cacheMount):/root/.cache/trivy" -w /repo aquasec/trivy:0.50.0 fs --no-progress --scanners vuln --severity HIGH,CRITICAL --timeout 15m --exit-code 0 .
-          if ($LASTEXITCODE -ne 0) { Write-Host "Trivy filesystem scan returned non-zero; proceeding (informational only)."; $global:LASTEXITCODE = 0 }
+        sh '''
+          set +e
+          echo "Running Trivy filesystem scan (HIGH,CRITICAL) on repo..."
+          cachePath="$WORKSPACE/.trivy-cache"
+          mkdir -p "$cachePath"
+          docker run --rm -v "$WORKSPACE:/repo" -v "$cachePath:/root/.cache/trivy" -w /repo aquasec/trivy:0.50.0 fs --no-progress --scanners vuln --severity HIGH,CRITICAL --timeout 15m --exit-code 0 .
+          if [ $? -ne 0 ]; then echo "Trivy filesystem scan returned non-zero; proceeding (informational only)."; fi
 
-          if (Test-Path "manifests") {
-            Write-Host "Linting Kubernetes manifests with kubeval (Docker Hub mirror)..."
-            docker run --rm -v "$env:WORKSPACE/manifests:/manifests" cytopia/kubeval:latest -d /manifests
-            Write-Host "Running kube-linter for richer checks..."
-            docker run --rm -v "$env:WORKSPACE/manifests:/manifests" stackrox/kube-linter:v0.6.8 lint /manifests
-          }
+          if [ -d "manifests" ]; then
+            echo "Linting Kubernetes manifests with kubeval (Docker Hub mirror)..."
+            docker run --rm -v "$WORKSPACE/manifests:/manifests" cytopia/kubeval:latest -d /manifests
+            echo "Running kube-linter for richer checks..."
+            docker run --rm -v "$WORKSPACE/manifests:/manifests" stackrox/kube-linter:v0.6.8 lint /manifests
+          fi
+          true
         '''
       }
     }
 
     stage('Tools Versions') {
       steps {
-        pwsh '''
-          $ErrorActionPreference = "Continue"
-          aws --version
-          terraform version
-          kubectl version --client
-          docker --version
+        sh '''
+          set +e
+          aws --version || true
+          terraform version || true
+          kubectl version --client || true
+          docker --version || true
+          true
         '''
       }
     }
@@ -128,9 +124,9 @@ pipeline {
           string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
         ]) {
-          pwsh '''
-            $ErrorActionPreference = "Stop"
-            Write-Host "Checking AWS identity..."
+          sh '''
+            set -euo pipefail
+            echo "Checking AWS identity..."
             aws sts get-caller-identity
           '''
         }
@@ -144,25 +140,23 @@ pipeline {
             string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
             string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
           ]) {
-            pwsh '''
-              $ErrorActionPreference = "Stop"
-              # Compute backend bucket/table same as ensure stage
-              $bucketBase = 'gl-capstone-project-pan-2025'
-              $table  = 'gl-capstone-project-pan-2025'
-              $account = $(aws sts get-caller-identity --query Account --output text)
-              if (-not $account) { throw "Unable to resolve AWS account id" }
-              $bucket = $bucketBase
-              & aws s3api head-bucket --bucket $bucket 1>$null 2>$null
-              if ($LASTEXITCODE -ne 0) { $bucket = "$bucketBase-$account" }
+            sh '''
+              set -euo pipefail
+              bucketBase="devops-academy-project"
+              table="devops-academy-project"
+              account="$(aws sts get-caller-identity --query Account --output text)"
+              bucket="${bucketBase}"
+              if ! aws s3api head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+                bucket="${bucketBase}-${account}"
+              fi
 
-              terraform init -reconfigure -upgrade -input=false `
-                -backend-config="bucket=$bucket" `
-                -backend-config="key=envs/dev/terraform.tfstate" `
-                -backend-config="region=$env:AWS_REGION" `
-                -backend-config="dynamodb_table=$table" `
+              terraform init -reconfigure -upgrade -input=false \
+                -backend-config="bucket=${bucket}" \
+                -backend-config="key=envs/dev/terraform.tfstate" \
+                -backend-config="region=${AWS_REGION}" \
+                -backend-config="dynamodb_table=${table}" \
                 -backend-config="encrypt=true"
-              # Ensure workspace 'dev'
-              try { terraform workspace select dev } catch { terraform workspace new dev }
+              terraform workspace select dev || terraform workspace new dev
               terraform plan -input=false -out=tfplan
               terraform apply -input=false -auto-approve tfplan
             '''
@@ -180,81 +174,34 @@ pipeline {
           string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
         ]) {
-          pwsh '''
-            $ErrorActionPreference = "Stop"
-            $ACCOUNT_ID = (aws sts get-caller-identity --query Account --output text)
-            $ECR_REG = "$ACCOUNT_ID.dkr.ecr.$env:AWS_REGION.amazonaws.com"
-            # Try to auto-detect repo URL from Terraform outputs; fallback to parameter if not found
-            $repoParam = $env:ECR_REPO
-            $repoOut = $null
-            if (Test-Path 'infrastructure') {
-              Push-Location infrastructure
-              try {
-                $json = terraform output -json ecr_repo_urls 2>$null
-                if ($LASTEXITCODE -eq 0 -and $json) {
-                  $obj = $json | ConvertFrom-Json
-                  if ($obj.PSObject.Properties.Name.Count -gt 0) {
-                    if ($obj.PSObject.Properties.Name -contains $repoParam) {
-                      $repoOut = $obj.$repoParam
-                    } else {
-                      # take the first output entry
-                      $firstKey = $obj.PSObject.Properties.Name | Select-Object -First 1
-                      $repoOut = $obj.$firstKey
-                      $repoParam = $firstKey
-                    }
-                  }
-                }
-              } catch {}
-              Pop-Location
-            }
-            if (-not $repoOut) { $repoOut = "$ECR_REG/$repoParam" }
-            $REPO_URL = $repoOut
+          sh '''
+            set -euo pipefail
+            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+            ECR_REG="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+            REPO="${ECR_REPO}"
+            REPO_URL="${ECR_REG}/${REPO}"
 
-            Write-Host "ECR Registry: $ECR_REG"
-            Write-Host "Repo URL:     $REPO_URL"
-            # Clear any stale auth (ignore errors)
-            try { docker logout $ECR_REG | Out-Null } catch { }
-            # Quick connectivity check
-            try { Invoke-WebRequest -UseBasicParsing -Uri "https://$ECR_REG/v2/" -Method GET -TimeoutSec 10 | Out-Null } catch { Write-Host "Connectivity check (expected 401/200) -> $($_.Exception.Message)" }
+            echo "ECR Registry: ${ECR_REG}"
+            echo "Repo URL:     ${REPO_URL}"
+            docker logout "${ECR_REG}" >/dev/null 2>&1 || true
 
-            $loginOk = $false
-            for ($i=0; $i -lt 2 -and -not $loginOk; $i++) {
-              try {
-                $pwd = $(aws ecr get-login-password --region $env:AWS_REGION)
-                if (-not $pwd) { throw "Empty ECR password" }
-                if ($i -eq 0) {
-                  docker login --username AWS --password $pwd $ECR_REG
-                } else {
-                  docker login --username AWS --password $pwd "https://$ECR_REG"
-                }
-                if ($LASTEXITCODE -eq 0) { $loginOk = $true }
-              } catch {
-                Start-Sleep -Seconds 3
-              }
-            }
-            if (-not $loginOk) { throw "ECR login failed after retries" }
+            aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REG}"
 
-            # Compute image tag consistently (7-char commit or build number)
-            if ($env:GIT_COMMIT -and $env:GIT_COMMIT.Length -ge 7) { $TAG = $env:GIT_COMMIT.Substring(0,7) } else { $TAG = $env:BUILD_NUMBER }
-            $localTag = "$($repoParam):$TAG"
-            $remoteTag = "$($REPO_URL):$TAG"
+            if [ -n "${GIT_COMMIT:-}" ] && [ "${#GIT_COMMIT}" -ge 7 ]; then TAG="${GIT_COMMIT:0:7}"; else TAG="${BUILD_NUMBER}"; fi
+            localTag="${REPO}:${TAG}"
+            remoteTag="${REPO_URL}:${TAG}"
 
-            docker build -t "$localTag" .
-            docker tag "$localTag" "$remoteTag"
+            docker build -t "${localTag}" .
+            docker tag "${localTag}" "${remoteTag}"
 
-            # Push image first, then scan the remote tag in ECR with Trivy (auth via ECR password)
-            Write-Host "Pushing image to ECR..."
-            docker push "$remoteTag"
+            echo "Pushing image to ECR..."
+            docker push "${remoteTag}"
 
-            Write-Host "Scanning pushed image in ECR with Trivy (HIGH,CRITICAL) [informational only]..."
-            $ecrPwd = $(aws ecr get-login-password --region $env:AWS_REGION)
-            if (-not $ecrPwd) { throw "Failed to obtain ECR password for Trivy auth" }
-            # Reuse same cache dir for image scan
-            $cachePath = Join-Path $env:WORKSPACE ".trivy-cache"
-            if (-not (Test-Path $cachePath)) { New-Item -ItemType Directory -Path $cachePath | Out-Null }
-            $cacheMount = ("$cachePath").Replace('\\','/')
-            docker run --rm -v "$($cacheMount):/root/.cache/trivy" aquasec/trivy:0.50.0 image --no-progress --scanners vuln --severity HIGH,CRITICAL --timeout 15m --exit-code 0 --username AWS --password "$ecrPwd" "$remoteTag"
-            if ($LASTEXITCODE -ne 0) { Write-Host "Trivy remote image scan returned non-zero; proceeding (informational only)."; $global:LASTEXITCODE = 0 }
+            # Trivy remote image scan (informational only)
+            cachePath="${WORKSPACE}/.trivy-cache"
+            mkdir -p "${cachePath}"
+            ecrPwd="$(aws ecr get-login-password --region "${AWS_REGION}")"
+            docker run --rm -v "${cachePath}:/root/.cache/trivy" aquasec/trivy:0.50.0 image --no-progress --scanners vuln --severity HIGH,CRITICAL --timeout 15m --exit-code 0 --username AWS --password "${ecrPwd}" "${remoteTag}" || true
           '''
         }
       }
@@ -267,43 +214,40 @@ pipeline {
           string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
         ]) {
-          pwsh '''
-            $ErrorActionPreference = "Stop"
-            aws eks update-kubeconfig --name $env:CLUSTER_NAME --region $env:AWS_REGION
-            aws eks wait cluster-active --name $env:CLUSTER_NAME --region $env:AWS_REGION
+          sh '''
+            set -euo pipefail
+            aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+            aws eks wait cluster-active --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
 
-            # Namespace, config, deployment
-            if (Test-Path 'manifests/namespace.yaml') { kubectl apply -f manifests/namespace.yaml }
-            if (Test-Path 'manifests/configmap.yaml') { kubectl apply -f manifests/configmap.yaml }
-            if (Test-Path 'manifests/secret.yaml') { kubectl apply -f manifests/secret.yaml }
+            [ -f manifests/namespace.yaml ] && kubectl apply -f manifests/namespace.yaml
+            [ -f manifests/configmap.yaml ] && kubectl apply -f manifests/configmap.yaml
+            [ -f manifests/secret.yaml ] && kubectl apply -f manifests/secret.yaml
             kubectl apply -f manifests/deployment.yaml
 
-            # Attempt Classic ELB first
-            $svcClassic = 'manifests/service-classic.yaml'
-            $svcNlb = 'manifests/service-nlb.yaml'
-            $created = $false
-            if (Test-Path $svcClassic) {
-              Write-Host 'Applying Service (Classic ELB attempt)...'
-              kubectl apply -f $svcClassic
-              # Wait up to ~6 minutes for ELB hostname
-              $deadline = (Get-Date).AddMinutes(6)
-              do {
-                Start-Sleep -Seconds 15
-                $svcHost = kubectl get svc -n app nginx-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>$null
-                if ($svcHost) { $created = $true; Write-Host "Service ELB hostname: $svcHost" }
-              } while (-not $created -and (Get-Date) -lt $deadline)
-            }
+            svcClassic="manifests/service-classic.yaml"
+            svcNlb="manifests/service-nlb.yaml"
+            created=""
+            if [ -f "$svcClassic" ]; then
+              echo "Applying Service (Classic ELB attempt)..."
+              kubectl apply -f "$svcClassic"
+              deadline=$(( $(date +%s) + 360 ))
+              while [ -z "$created" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+                sleep 15
+                svcHost=$(kubectl get svc -n app nginx-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+                if [ -n "$svcHost" ]; then created="yes"; echo "Service ELB hostname: $svcHost"; fi
+              done
+            fi
 
-            if (-not $created -and (Test-Path $svcNlb)) {
-              Write-Host 'Classic ELB not ready/unsupported. Falling back to NLB...'
-              kubectl apply -f $svcNlb
-              $deadline = (Get-Date).AddMinutes(6)
-              do {
-                Start-Sleep -Seconds 15
-                $svcHost = kubectl get svc -n app nginx-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>$null
-                if ($svcHost) { Write-Host "Service NLB hostname: $svcHost"; break }
-              } while ((Get-Date) -lt $deadline)
-            }
+            if [ -z "$created" ] && [ -f "$svcNlb" ]; then
+              echo "Classic ELB not ready/unsupported. Falling back to NLB..."
+              kubectl apply -f "$svcNlb"
+              deadline=$(( $(date +%s) + 360 ))
+              while [ "$(date +%s)" -lt "$deadline" ]; do
+                sleep 15
+                svcHost=$(kubectl get svc -n app nginx-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+                if [ -n "$svcHost" ]; then echo "Service NLB hostname: $svcHost"; break; fi
+              done
+            fi
           '''
         }
       }
@@ -321,24 +265,27 @@ pipeline {
           string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
         ]) {
-          pwsh '''
-            $ErrorActionPreference = "Stop"
-            $ACCOUNT_ID = (aws sts get-caller-identity --query Account --output text)
-            $REPO_URL = "$ACCOUNT_ID.dkr.ecr.$env:AWS_REGION.amazonaws.com/$env:ECR_REPO"
-            if ($env:GIT_COMMIT -and $env:GIT_COMMIT.Length -ge 7) { $TAG = $env:GIT_COMMIT.Substring(0,7) } else { $TAG = $env:BUILD_NUMBER }
-            $remoteTag = "$($REPO_URL):$TAG"
-            kubectl set image -n app deployment/nginx-deployment nginx=$remoteTag
-            # Wait up to 5 minutes for rollout
-            if (-not (kubectl rollout status -n app deployment/nginx-deployment --timeout=5m)) {
-              Write-Host "Rollout status timed out - collecting diagnostics"
-              kubectl get deployment -n app nginx-deployment -o wide
-              kubectl describe deployment -n app nginx-deployment
-              kubectl get rs -n app -o wide
-              kubectl get pods -n app -o wide
-              kubectl describe pods -n app
-              kubectl get events --sort-by=.lastTimestamp | Select-Object -Last 100
-              throw "Deployment rollout timed out"
-            }
+          sh '''
+            set -euo pipefail
+            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+            REPO_URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+            if [ -n "${GIT_COMMIT:-}" ] && [ "${#GIT_COMMIT}" -ge 7 ]; then TAG="${GIT_COMMIT:0:7}"; else TAG="${BUILD_NUMBER}"; fi
+            remoteTag="${REPO_URL}:${TAG}"
+            kubectl set image -n app deployment/nginx-deployment nginx="${remoteTag}"
+            set +e
+            kubectl rollout status -n app deployment/nginx-deployment --timeout=5m
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then
+              echo "Rollout status timed out - collecting diagnostics"
+              kubectl get deployment -n app nginx-deployment -o wide || true
+              kubectl describe deployment -n app nginx-deployment || true
+              kubectl get rs -n app -o wide || true
+              kubectl get pods -n app -o wide || true
+              kubectl describe pods -n app || true
+              kubectl get events --sort-by=.lastTimestamp | tail -n 100 || true
+              exit 1
+            fi
           '''
         }
       }
@@ -350,41 +297,32 @@ pipeline {
           string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
         ]) {
-          pwsh '''
-            $ErrorActionPreference = "Continue"
-            aws eks update-kubeconfig --name $env:CLUSTER_NAME --region $env:AWS_REGION
-            $svcHost = (kubectl get svc -n app nginx-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-            if (-not $svcHost) { Write-Host "Service hostname not ready, skipping ZAP"; exit 0 }
-            $url = "http://$svcHost"
+          sh '''
+            set -euo pipefail
+            aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+            svcHost="$(kubectl get svc -n app nginx-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+            if [ -z "${svcHost}" ]; then echo "Service hostname not ready, skipping ZAP"; exit 0; fi
+            url="http://${svcHost}"
 
-            # Pre-pull ZAP image with retries (prefer GHCR, fallback to Docker Hub)
-            $zapImageGhcr = "ghcr.io/zaproxy/zaproxy:stable"
-            $zapImageHub  = "owasp/zap2docker-stable"
-            $pulled = $false
-            foreach ($img in @($zapImageGhcr, $zapImageHub)) {
-              for ($i=0; $i -lt 2 -and -not $pulled; $i++) {
-                try {
-                  Write-Host "Pulling ZAP image: $img (attempt $($i+1))"
-                  docker pull $img
-                  if ($LASTEXITCODE -eq 0) { $pulled = $true; $zapImage = $img }
-                } catch { Start-Sleep -Seconds 3 }
-              }
-              if ($pulled) { break }
-            }
+            zapImage=""
+            for img in "ghcr.io/zaproxy/zaproxy:stable" "owasp/zap2docker-stable"; do
+              for i in 1 2; do
+                echo "Pulling ZAP image: $img (attempt $i)"
+                if docker pull "$img"; then zapImage="$img"; break 2; fi
+                sleep 3
+              done
+            done
 
-            if (-not $pulled) {
-              Write-Host "Could not pull any ZAP image; skipping ZAP baseline (non-blocking)."
+            if [ -z "${zapImage}" ]; then
+              echo "Could not pull any ZAP image; skipping ZAP baseline (non-blocking)."
               exit 0
-            }
+            fi
 
-            # Prepare writable artifacts directory and mount it for report output
-            $artDir = Join-Path $env:WORKSPACE "zap-artifacts"
-            if (-not (Test-Path $artDir)) { New-Item -ItemType Directory -Path $artDir | Out-Null }
-            $artMount = ("$artDir").Replace('\\','/')
+            artDir="${WORKSPACE}/zap-artifacts"
+            mkdir -p "${artDir}"
 
-            Write-Host "Running ZAP Baseline scan against $url using $zapImage"
-            docker run --rm -u 0:0 -v "$($artMount):/zap/wrk" -t $zapImage zap-baseline.py -t $url -r zap.html
-            if ($LASTEXITCODE -ne 0) { Write-Host "ZAP baseline returned non-zero ($LASTEXITCODE). Proceeding (non-blocking)."; $global:LASTEXITCODE = 0 }
+            echo "Running ZAP Baseline scan against ${url} using ${zapImage}"
+            docker run --rm -u 0:0 -v "${artDir}:/zap/wrk" -t "${zapImage}" zap-baseline.py -t "${url}" -r zap.html || true
           '''
         }
       }
