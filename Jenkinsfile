@@ -13,7 +13,7 @@ pipeline {
 
   environment {
     // Ensure Homebrew bin paths are available for Jenkins on macOS (pwsh, aws, terraform, kubectl, docker)
-    PATH = "/usr/local/bin:/opt/homebrew/bin:${PATH}"
+    PATH = "/usr/local/bin:/opt/homebrew/bin:/Applications/PowerShell.app/Contents/MacOS:${PATH}"
   }
 
   stages {
