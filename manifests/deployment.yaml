@@ -18,6 +18,9 @@ spec:
       securityContext:
         runAsUser: 101
         runAsNonRoot: true
+        runAsGroup: 101
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
